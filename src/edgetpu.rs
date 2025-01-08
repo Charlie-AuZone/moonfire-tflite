@@ -112,6 +112,7 @@ impl Device {
         Ok(super::Delegate {
             delegate,
             free: edgetpu_free_delegate,
+            external_lib: None,
         })
     }
 

@@ -1,19 +1,27 @@
+extern crate num;
+#[macro_use]
+extern crate num_derive;
+
 // Copyright (C) 2020 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: Apache-2.0
 
 use std::convert::TryFrom;
-use std::ffi::CStr;
+use std::ffi::{c_void, CStr};
 use std::marker::PhantomData;
 use std::os::raw::c_char;
 use std::ptr;
 
+use delegate::Delegate;
+
 #[cfg(feature = "edgetpu")]
 pub mod edgetpu;
+
+pub mod delegate;
 
 // Opaque types from the C interface.
 // https://doc.rust-lang.org/nomicon/ffi.html#representing-opaque-structs
 #[repr(C)]
-struct TfLiteDelegate {
+pub struct TfLiteDelegate {
     _private: [u8; 0],
 }
 #[repr(C)]
@@ -36,7 +44,7 @@ pub struct Tensor {
 // Type, aka TfLiteType
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(C)]
-pub enum Type {
+pub enum TensorType {
     NoType = 0,
     Float32 = 1,
     Int32 = 2,
@@ -48,6 +56,55 @@ pub enum Type {
     Complex64 = 8,
     Int8 = 9,
     Float16 = 10,
+}
+
+#[derive(FromPrimitive, Debug)]
+pub enum TfLiteStatusEnum {
+    /// Success
+    TfLiteOk = 0,
+
+    /// Generally referring to an error in the runtime (i.e. interpreter)
+    TfLiteError = 1,
+
+    /// Generally referring to an error from a TfLiteDelegate itself.
+    TfLiteDelegateError = 2,
+
+    /// Generally referring to an error in applying a delegate due to
+    /// incompatibility between runtime and delegate, e.g., this error is returned
+    /// when trying to apply a TF Lite delegate onto a model graph that's already
+    /// immutable.
+    TfLiteApplicationError = 3,
+
+    /// Generally referring to serialized delegate data not being found.
+    /// See tflite::delegates::Serialization.
+    TfLiteDelegateDataNotFound = 4,
+
+    /// Generally referring to data-writing issues in delegate serialization.
+    /// See tflite::delegates::Serialization.
+    TfLiteDelegateDataWriteError = 5,
+
+    /// Generally referring to data-reading issues in delegate serialization.
+    /// See tflite::delegates::Serialization.
+    TfLiteDelegateDataReadError = 6,
+
+    /// Generally referring to issues when the TF Lite model has ops that cannot
+    /// be resolved at runtime. This could happen when the specific op is not
+    /// registered or built with the TF Lite framework.
+    TfLiteUnresolvedOps = 7,
+
+    /// Generally referring to invocation cancelled by the user.
+    /// See `interpreter::Cancel`.
+    // TODO(b/194915839): Implement `interpreter::Cancel`.
+    // TODO(b/250636993): Cancellation triggered by `SetCancellationFunction`
+    // should also return this status code.
+    TfLiteCancelled = 8,
+
+    // This status is returned by Prepare when the output shape cannot be
+    // determined but the size of the output tensor is known. For example, the
+    // output of reshape is always the same size as the input. This means that
+    // such ops may be
+    // done in place.
+    TfLiteOutputShapeNotKnown = 9,
 }
 
 #[derive(Copy, Clone)]
@@ -84,21 +141,25 @@ extern "C" {
         output_index: i32,
     ) -> *const Tensor;
 
-    fn TfLiteTensorType(tensor: *const Tensor) -> Type;
+    fn TfLiteTensorType(tensor: *const Tensor) -> TensorType;
     fn TfLiteTensorNumDims(tensor: *const Tensor) -> i32;
     fn TfLiteTensorDim(tensor: *const Tensor, dim_index: i32) -> i32;
     fn TfLiteTensorByteSize(tensor: *const Tensor) -> usize;
-    fn TfLiteTensorData(tensor: *const Tensor) -> *mut u8;
+    fn TfLiteTensorData(tensor: *const Tensor) -> *mut c_void;
     fn TfLiteTensorName(tensor: *const Tensor) -> *const c_char;
 
-    fn TfLiteTypeGetName(type_: Type) -> *const c_char;
+    fn TfLiteTypeGetName(type_: TensorType) -> *const c_char;
 }
 
 impl TfLiteStatus {
-    fn to_result(self) -> Result<(), ()> {
-        match self.0 {
-            0 => Ok(()),
-            _ => Err(()),
+    fn to_result(self) -> Result<(), String> {
+        let status = match num::FromPrimitive::from_i32(self.0) {
+            Some(v) => v,
+            None => return Err(format!("Unknown TfLiteStatus: {}", self.0)),
+        };
+        match status {
+            TfLiteStatusEnum::TfLiteOk => Ok(()),
+            _ => Err(format!("{:?}", status)),
         }
     }
 }
@@ -127,11 +188,12 @@ impl<'a> InterpreterBuilder<'a> {
         self.owned_delegates.push(d);
     }
 
-    pub fn build(mut self, model: &Model) -> Result<Interpreter<'a>, ()> {
+    pub fn build(mut self, model: &Model) -> Result<Interpreter<'a>, String> {
         let interpreter =
-            unsafe { TfLiteInterpreterCreate(model.0.as_ptr(), self.options.as_ptr()) };
+            unsafe { TfLiteInterpreterCreate(model.ptr.as_ptr(), self.options.as_ptr()) };
         let interpreter = Interpreter {
-            interpreter: ptr::NonNull::new(interpreter).ok_or(())?,
+            interpreter: ptr::NonNull::new(interpreter)
+                .ok_or("TfLiteInterpreterCreate returned NULL")?,
             _owned_delegates: std::mem::replace(&mut self.owned_delegates, Vec::new()),
             _delegate_refs: PhantomData,
         };
@@ -158,16 +220,27 @@ impl<'a> Interpreter<'a> {
         InterpreterBuilder::new()
     }
 
-    pub fn invoke(&mut self) -> Result<(), ()> {
+    pub fn invoke(&mut self) -> Result<(), String> {
         unsafe { TfLiteInterpreterInvoke(self.interpreter.as_ptr()) }.to_result()
     }
 
-    pub fn inputs(&mut self) -> InputTensors {
+    pub fn inputs(&self) -> InputTensors {
         let len = usize::try_from(unsafe {
             TfLiteInterpreterGetInputTensorCount(self.interpreter.as_ptr())
         })
         .unwrap();
         InputTensors {
+            interpreter: self,
+            len,
+        }
+    }
+
+    pub fn inputs_mut(&mut self) -> InputTensorsMut {
+        let len = usize::try_from(unsafe {
+            TfLiteInterpreterGetInputTensorCount(self.interpreter.as_ptr())
+        })
+        .unwrap();
+        InputTensorsMut {
             interpreter: self,
             len,
         }
@@ -214,7 +287,29 @@ impl<'i> std::ops::Index<usize> for InputTensors<'i> {
     }
 }
 
-impl<'i> std::ops::IndexMut<usize> for InputTensors<'i> {
+// TODO: impl iterator trait for InputTensors
+
+pub struct InputTensorsMut<'i> {
+    interpreter: &'i Interpreter<'i>,
+    len: usize,
+}
+
+impl<'i> InputTensorsMut<'i> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl<'i> std::ops::Index<usize> for InputTensorsMut<'i> {
+    type Output = Tensor;
+
+    fn index(&self, index: usize) -> &Tensor {
+        let index = i32::try_from(index).unwrap();
+        unsafe { &*TfLiteInterpreterGetInputTensor(self.interpreter.interpreter.as_ptr(), index) }
+    }
+}
+
+impl<'i> std::ops::IndexMut<usize> for InputTensorsMut<'i> {
     fn index_mut(&mut self, index: usize) -> &mut Tensor {
         let index = i32::try_from(index).unwrap();
         unsafe {
@@ -243,8 +338,10 @@ impl<'i> std::ops::Index<usize> for OutputTensors<'i> {
     }
 }
 
+// TODO: impl iterator trait for OutputTensors
+
 impl Tensor {
-    pub fn type_(&self) -> Type {
+    pub fn tensor_type(&self) -> TensorType {
         unsafe { TfLiteTensorType(self) }
     }
     pub fn num_dims(&self) -> usize {
@@ -258,22 +355,49 @@ impl Tensor {
     pub fn byte_size(&self) -> usize {
         unsafe { TfLiteTensorByteSize(self) }
     }
-    pub fn bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(TfLiteTensorData(self), self.byte_size()) }
-    }
-    pub fn bytes_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(TfLiteTensorData(self), self.byte_size()) }
-    }
-    pub fn f32s(&self) -> &[f32] {
-        // Tensors are aligned.
-        assert_eq!(self.type_(), Type::Float32);
-        let bytes = self.bytes();
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() >> 2) }
-    }
+
     pub fn name(&self) -> &str {
         unsafe { CStr::from_ptr(TfLiteTensorName(self)) }
             .to_str()
             .unwrap()
+    }
+
+    pub fn shape(&self) -> Vec<usize> {
+        let num_dims = self.num_dims();
+        let mut dims = Vec::with_capacity(num_dims);
+        for i in 0..num_dims {
+            dims.push(self.dim(i));
+        }
+        dims
+    }
+
+    pub fn volume(&self) -> usize {
+        self.shape().iter().fold(1, |acc, x| acc * x)
+    }
+
+    pub fn maprw<'a, T>(&'a mut self) -> Result<&'a mut [T], String> {
+        let volume = self.volume();
+        if std::mem::size_of::<T>() * volume > self.byte_size() {
+            return Err(format!(
+                "Tensor too small to map as {}",
+                std::any::type_name::<T>()
+            ));
+        }
+        let ptr = unsafe { TfLiteTensorData(self) } as *mut T;
+        let volume = self.shape().iter().fold(1, |acc, x| acc * x);
+        Ok(unsafe { std::slice::from_raw_parts_mut(ptr, volume as usize) })
+    }
+
+    pub fn mapro<'a, T>(&'a self) -> Result<&'a [T], String> {
+        let volume = self.volume();
+        if std::mem::size_of::<T>() * volume > self.byte_size() {
+            return Err(format!(
+                "Tensor too small to map as {}",
+                std::any::type_name::<T>()
+            ));
+        }
+        let ptr = unsafe { TfLiteTensorData(self) } as *mut T;
+        Ok(unsafe { std::slice::from_raw_parts(ptr, volume as usize) })
     }
 }
 
@@ -289,11 +413,11 @@ impl std::fmt::Debug for Tensor {
             first = false;
             write!(f, "{}", self.dim(i))?;
         }
-        write!(f, " {:?}", self.type_())
+        write!(f, " {:?}", self.tensor_type())
     }
 }
 
-impl std::fmt::Debug for Type {
+impl std::fmt::Debug for TensorType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
             unsafe { CStr::from_ptr(TfLiteTypeGetName(*self)) }
@@ -303,29 +427,25 @@ impl std::fmt::Debug for Type {
     }
 }
 
-pub struct Delegate {
-    delegate: ptr::NonNull<TfLiteDelegate>,
-    free: unsafe extern "C" fn(*mut TfLiteDelegate),
+#[allow(dead_code)]
+pub struct Model {
+    ptr: ptr::NonNull<TfLiteModel>,
+    model_mem: Vec<u8>,
 }
-
-impl Drop for Delegate {
-    fn drop(&mut self) {
-        unsafe { (self.free)(self.delegate.as_ptr()) };
-    }
-}
-
-pub struct Model(ptr::NonNull<TfLiteModel>);
 
 impl Model {
-    pub fn from_static(model: &'static [u8]) -> Result<Self, ()> {
+    pub fn from_mem(model: Vec<u8>) -> Result<Self, String> {
         let m = unsafe { TfLiteModelCreate(model.as_ptr(), model.len()) };
-        Ok(Model(ptr::NonNull::new(m).ok_or(())?))
+        Ok(Model {
+            ptr: ptr::NonNull::new(m).ok_or("TfLiteModelCreate returned NULL")?,
+            model_mem: model,
+        })
     }
 }
 
 impl Drop for Model {
     fn drop(&mut self) {
-        unsafe { TfLiteModelDelete(self.0.as_ptr()) };
+        unsafe { TfLiteModelDelete(self.ptr.as_ptr()) };
     }
 }
 
@@ -336,12 +456,12 @@ mod tests {
 
     #[test]
     fn create_drop_model() {
-        let _m = super::Model::from_static(MODEL).unwrap();
+        let _m = super::Model::from_mem(MODEL.to_vec()).unwrap();
     }
 
     #[test]
     fn lifecycle() {
-        let m = super::Model::from_static(MODEL).unwrap();
+        let m = super::Model::from_mem(MODEL.to_vec()).unwrap();
         let builder = super::Interpreter::builder();
         let mut interpreter = builder.build(&m).unwrap();
         println!(
